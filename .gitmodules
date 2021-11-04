@@ -1,0 +1,3 @@
+[submodule "EMNLP_17_submission"]
+	path = NEM
+	url = git@github.com:jeknov/EMNLP_17_submission.git
