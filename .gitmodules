@@ -1,3 +1,6 @@
 [submodule "NEM"]
 	path = NEM
 	url = git@github.com:jeknov/EMNLP_17_submission.git
+[submodule "card-et-al2020_NLP-power-analysis"]
+	path = card-et-al2020_NLP-power-analysis
+	url = git@github.com:dallascard/NLP-power-analysis.git

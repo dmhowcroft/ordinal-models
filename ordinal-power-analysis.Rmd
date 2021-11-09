@@ -1,0 +1,499 @@
+---
+title: "Ordinal Power Analysis"
+author: "Dave Howcroft"
+date: "3/15/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+CACHE_PATH <- ".knitr-cache/ordinal-power-analysis_cache/"
+dir.create(CACHE_PATH, recursive = "TRUE")
+knitr::opts_chunk$set(echo = TRUE, verbose = TRUE)
+knitr::opts_chunk$set(cache.path = CACHE_PATH)
+```
+
+Here we simulate hundreds of ordinal datasets and analyse the power of both linear 
+and ordinal models to detect true differences of varying sizes.
+
+## Setting up
+
+### Necessary Libraries
+
+```{r load_libraries}
+# For creating experimental design grids/lists
+library(designr)
+# For Linear Mixed Effects Models
+library(lme4)
+# For p-values from lme4
+library(lmerTest)
+# For ordinal regressions (mixed effects models)
+library(ordinal)
+# For a variety of optimization algorithms
+library(optimx)
+# For pretty model checks for linear models
+library(performance)
+# For convenience functions
+library(tidyverse)
+
+
+# Libraries and config for multicore processing
+library(foreach)
+library(doParallel)
+library(itertools)
+
+# NB: makeForkCluster() not valid on Windows
+NUM_CORES <- 10
+cl <- parallel::makeForkCluster(NUM_CORES)
+doParallel::registerDoParallel(cl)
+
+set.seed(42)
+```
+
+### Setting General Parameters
+
+```{r simulation_parameters}
+# How many sets of parameters do we want to simulate?
+NUM_PARAMETER_SETS <- 100
+# How many items do we want per condition?
+NUM_ITEMS_PER_CONDITION <- c(50, 100, 500)
+# How many ratings do we want for each item?
+NUM_RATINGS_PER_ITEM <- c(3, 10)
+```
+
+#### Setting Parameters for Ordinal Data Simulation
+
+For our simulations, we can either fix parameters absolutely or sample a variety of reasonable parameters.
+The latter may give us an idea of how models will perform under a variety of circumstances,
+but fixing the parameters helps us to understand the limits of their behavior in particular circumstances.
+
+Therefore we will set `model_effect` to a single value rather than sampling a range of representative values (which might include 0!)
+and only sample the thresholds, which are not central to our analyses.
+
+From Card et al. and NEM data, we estimate a mean effect size of -0.07 (sd = 0.47; min = -0.6 max ~1.0).
+For the thresholds, the minimum has a mean of -1.79 (sd = 0.17),
+and the distance between thresholds has a mean of 0.62 (sd = 0.20).
+
+For Card et al.'s normalised data, they used effect sizes equal to 0.25, 0.5, 0.75, and 1.0 times
+the distance between two adjacent thresholds (=0.20 for a 6-pt rating scale normalised to 0-1).
+We set our effect sizes similarly, based on the mean distance between thresholds for datasets with a 6-point scale (0.62).
+
+```{r model_and_fixed_effects_parameters}
+MEAN_THRESHOLD_DISTANCE <- 0.62
+SD_FOR_THRESHOLD_DISTANCE <- 0.18
+MODEL_EFFECT <- seq(0.25, 1, 0.25) * MEAN_THRESHOLD_DISTANCE
+# We need 4 threshold distances between 5 thresholds for 6 bins
+# TODO: fix this to return only positive values without using abs()
+threshold_distances <- abs(matrix(rnorm(4 * NUM_PARAMETER_SETS, 
+                                        mean = MEAN_THRESHOLD_DISTANCE, 
+                                        sd = SD_FOR_THRESHOLD_DISTANCE), 
+                                  ncol = 4))
+LOWEST_THRESHOLD_MEAN <- -1.78
+LOWEST_THRESHOLD_SD <- 0.19
+lowest_threshold <- rnorm(NUM_PARAMETER_SETS, 
+                          mean = LOWEST_THRESHOLD_MEAN, 
+                          sd = LOWEST_THRESHOLD_SD)
+```
+
+We also need to set the parameters for the random effects.
+We define three variance settings: 'representative', low-variance, and high-variance.
+
+```{r random_effects_parameters}
+participants_extra_low <- c(intercept = 0.28, slope = 0.11)
+participants_low <- c(intercept = 0.48, slope = 0.27)
+participants_representative <- c(intercept = 0.52, slope = 0.43)
+participants_high <- c(intercept = 0.56, slope = 0.67)
+participants_extra_high <- participants_high
+items_extra_low <- c(intercept = 0.29, slope = 0.43)
+items_low <- c(intercept = 0.29, slope = 0.63)
+items_representative <- c(intercept = 0.57, slope = 0.77)
+items_high <- c(intercept = 0.71, slope = 0.89)
+items_extra_high <- c(intercept = 1.09, slope = 1.26)
+```
+
+### Defining functions
+
+We define several helper functions to decompose the simulations.
+
+```{r def_expand_counts}
+#' Expand a list of counts into a list of observed values.
+#'
+#' For example, if counts = c(0, 2, 1), we will return c(2, 2, 3),
+#' where we have created 0 observations of 1, 2 observations of 2, and 1 observation of 3.
+#' 
+#' @param counts a vector or list of counts
+#' @return a set of observed values V such that count(V) = counts
+expand_counts <- function(counts) {
+  return(rep(1:length(counts), counts))
+}
+```
+
+```{r def_sample_ratings_based_on_latent_normal}
+#' Return a vector of counts for `k = length(thresholds) - 1` categories sampled 
+#' according to an ordered probit model specified.
+#'
+#' @param mu latent mean
+#' @param sigma latent standard deviation
+#' @param thresholds a vector of thresholds dividing (-Inf, Inf) into `k` bins
+#' @param num_samples the number of samples to draw
+#' @return a vector of counts for the `k` categories 
+sample_ratings_based_on_latent_normal <- function(mu, sigma, thresholds, num_samples = 100) {
+  cdf <- pnorm(thresholds, mu, sigma)
+  upper_cdf <- cdf[2:length(cdf)]
+  rating_probs <- upper_cdf - cdf[1:length(cdf) - 1]
+
+  return(rmultinom(1, num_samples, prob = rating_probs))
+}
+```
+
+```{r def_generate_data_skeleton}
+#' make a data set with a full factorial of annotators, items
+#' 
+#' 2 conditions for model: sysA or sysB
+#'
+#' @param nannotators total number of annotators
+#' @param nitems total number of items
+#' @param nperitem number of ratings for each item from each model
+#' @return a dataframe with columns `participant`, `item`, and `model` with `nperitem` workers for each combination of `item` and `model`
+generate_data_skeleton <- function(num_participants, nitems, nperitem) {
+  # TODO figure out why they code model this way
+  return(expand.grid(participant = factor(1:num_participants),
+                     item = factor(1:nitems),
+                     model = c(0, 1)) %>%
+           group_by(item, model) %>%
+           sample_n(nperitem))
+}
+```
+
+```{r def_sample_ratings_with_random_effects}
+sample_ratings_based_on_latent_normal_with_random_effects <- function(model_effect, 
+                                                  thresholds, 
+                                                  item_effects,
+                                                  participant_effects,
+                                                  data_skeleton) {
+  item_intercepts <- rnorm(length(unique(data_skeleton$item)), 
+                                  0,
+                                  item_effects[[1]])
+  names(item_intercepts) <- unique(data_skeleton$item)
+  
+  item_slopes <- rnorm(length(unique(data_skeleton$item)), 
+                                  0,
+                                  item_effects[[2]])
+  names(item_slopes) <- unique(data_skeleton$item)
+
+  
+  
+  participant_intercepts <- rnorm(length(unique(data_skeleton$participant)), 
+                                  0,
+                                  participant_effects[[1]])
+  names(participant_intercepts) <- unique(data_skeleton$participant)
+  
+  participant_slopes <- rnorm(length(unique(data_skeleton$participant)), 
+                                  0,
+                                  participant_effects[[2]])
+  names(participant_slopes) <- unique(data_skeleton$participant)
+
+  
+  
+  data_skeleton$participant <- as.numeric(data_skeleton$participant)
+  data_skeleton$item <- as.numeric(data_skeleton$item)
+  
+  data_skeleton$latent_response <- rnorm(nrow(data_skeleton)) + 
+    data_skeleton$model * model_effect +
+    
+    participant_intercepts[data_skeleton$participant] +
+    data_skeleton$model * participant_slopes[data_skeleton$participant] +
+    
+    item_intercepts[data_skeleton$item] +
+    data_skeleton$model * item_slopes[data_skeleton$item]
+  data_skeleton$integral_response <- as.numeric(cut(data_skeleton$latent_response, breaks = thresholds, labels = seq(length(thresholds) - 1)))
+  
+  return(data_skeleton)
+}
+```
+
+
+```{r def_simulate_random_effects}
+simulate_random_effects <- function(lowest_threshold, threshold_distances, 
+                                    model_effect,
+                                    by_items_intercept_and_slope,
+                                    by_participant_intercept_and_slope,
+                                    data_skeleton) {
+  thresholds <- c(-Inf, 
+                  lowest_threshold, 
+                  lowest_threshold + cumsum(threshold_distances), 
+                  Inf)
+  
+  return(sample_ratings_based_on_latent_normal_with_random_effects(model_effect,
+                                                                   thresholds,
+                                                                   by_items_intercept_and_slope,
+                                                                   by_participant_intercept_and_slope,
+                                                                   data_skeleton))
+}
+```
+
+```{r def_compatible_list_lengths}
+compatible_list_lengths <- function(num_items, num_conditions) {
+  divisors <- numbers::divisors(num_items)
+  compatible_list_lengths <- Filter(function(x) {x %% num_conditions == 0}, divisors)
+  return(compatible_list_lengths)
+}
+```
+
+```{r def_create_experimental_design}
+sample_experimental_design <- function(num_models, num_items, num_ratings_per_item,
+                           per_participant_item_limits=c(10, 30)) {
+  design <- fixed.factor("Model", levels = 0:(num_models - 1)) + 
+    random.factor("Participant") + 
+    # We specify num_items / num_models instances, because `designr`
+    # will multiply the instances by the groups for the Participant x Item block.
+    # That block is necessary to ensure that each participant only sees an item
+    # one time, but would lead to the addition of unnecessary items 
+    random.factor("Item", instances = num_items / num_models) + 
+    random.factor(c("Participant", "Item"), groups = "Model")
+  codes <- design.codes(design)
+  
+  # TODO integrate the following commented out code
+  compatible_list_lengths <- compatible_list_lengths(num_items, num_models)
+  if (length(compatible_list_lengths) == 0) {
+    # TODO create a version for lists where we don't mind if subjects see an unbalanced number of conditions.
+    stop(paste("Cannot create simple lists with", num_items, "items and", num_conditions, "conditions."))
+  }
+  target_list_length <- sample(compatible_list_lengths, 1)
+  # TODO add code for selecting "good" list lengths
+  # target_list_length <- 4
+  num_lists <- num_items / target_list_length
+  
+  num_items_per_condition_per_list <- target_list_length / num_models
+  
+  list_assignments <- unlist(lapply(1:(num_lists * length(levels(codes$Participant))), 
+                                    function(x) {rep(x, target_list_length)}))
+  initial_design <- codes %>% mutate(List = list_assignments) %>% select(-Participant)
+  
+  multiples_of_list_lengths <- target_list_length * 1:num_lists
+  valid_multiples <- multiples_of_list_lengths >= per_participant_item_limits[1] & multiples_of_list_lengths <= per_participant_item_limits[2]
+  
+  num_unique_participants_per_replication <- sample(multiples_of_list_lengths[valid_multiples], 1) / target_list_length
+  # num_unique_participants_per_replication <- 5
+  initial_design <- initial_design %>% mutate(Participant = List %% num_unique_participants_per_replication)
+  
+  new_design <- initial_design
+  
+  for (i in 1:(num_ratings_per_item - 1)) {
+    copy <- initial_design %>% mutate(Participant = Participant + num_unique_participants_per_replication * i)
+    new_design <- rbind(new_design, copy)
+  }
+  return(new_design)
+}
+
+create_experimental_design <- function(num_models, num_items, num_ratings_per_item,
+                                       target_list_length, num_unique_participants_per_replication) {
+  design <- fixed.factor("Model", levels = 0:(num_models - 1)) + 
+    random.factor("Participant") + 
+    # We specify num_items / num_models instances, because `designr`
+    # will multiply the instances by the groups for the Participant x Item block.
+    # That block is necessary to ensure that each participant only sees an item
+    # one time, but would lead to the addition of unnecessary items 
+    random.factor("Item", instances = num_items / num_models) + 
+    random.factor(c("Participant", "Item"), groups = "Model")
+  codes <- design.codes(design)
+  
+  num_lists <- num_items / target_list_length
+  
+  list_assignments <- unlist(lapply(1:(num_lists * length(levels(codes$Participant))), 
+                                    function(x) {rep(x, target_list_length)}))
+  initial_design <- codes %>% mutate(List = list_assignments) %>% select(-Participant)
+  
+  initial_design <- initial_design %>% mutate(Participant = List %% num_unique_participants_per_replication)
+  
+  new_design <- initial_design
+  
+  for (i in 1:(num_ratings_per_item - 1)) {
+    copy <- initial_design %>% mutate(Participant = Participant + num_unique_participants_per_replication * i)
+    new_design <- rbind(new_design, copy)
+  }
+  return(new_design)
+}
+```
+
+
+```{r def_run_random_effects}
+run_random_effects <- function(num_participants, num_items, model_effect,
+                               by_items_effects, by_participants_effects) {
+  p_values <- as.data.frame(list(lme_p=rep(-1, NUM_PARAMETER_SETS),
+                                 clm_p=rep(-1, NUM_PARAMETER_SETS)))
+  # Hard-coded for now...
+  # TODO extract this code / make things more general
+  new_design <- create_experimental_design(2, num_items, num_participants, 
+                                           4, 
+                                           ifelse(num_items == 50, 5, 
+                                                  ifelse(num_items == 100, 10, 
+                                                         ifelse(num_items == 500, 50, 
+                                                                NULL))))
+  skel <- new_design %>% rename(participant = Participant, model = Model, item = Item)
+  model_effect <- rep(model_effect, NUM_PARAMETER_SETS)
+  for (i in seq(NUM_PARAMETER_SETS)) {
+    df <- simulate_random_effects(lowest_threshold[i], threshold_distances[i, ],
+                                  model_effect[i],
+                                  by_items_effects,
+                                  by_participants_effects,
+                                  skel)
+    df$normalised_response <- (df$integral_response - min(df$integral_response)) / max(df$integral_response)
+    df$ordinal_response <- as.ordered(df$integral_response)
+    
+    
+    fit_lme <- lm(normalised_response ~ model,
+                  df)
+    p_values$lme_fe[i] <- coef(summary(fit_lme))['model', 'Pr(>|t|)']
+    
+    
+    fit_clm <- clm(ordinal_response ~ model,
+                   data=df,
+                   link = "probit",
+                   threshold = "flexible")
+  
+    p_values$clm_fe[i] <- coef(summary(fit_clm))['model', 'Pr(>|z|)']
+  
+  
+    fit_lm_re <- lmer(normalised_response ~ model + (model|participant) + (model|item),
+                      df,
+                      REML=FALSE)
+    p_values$lme_re[i] <- coef(summary(fit_lm_re))['model', 'Pr(>|t|)']
+  
+  
+    fit_clm_re <- clmm(ordinal_response ~ model + (model|participant) + (model|item),
+                    data=df,
+                    link = "probit",
+                    threshold = "flexible")
+    p_values$clm_re[i] <- coef(summary(fit_clm_re))['model', 'Pr(>|z|)']
+  }
+  return(p_values)
+}
+```
+
+## Run the simulations
+
+```{r def_run_given_variance}
+run_given_variance <- function(by_items_effects, by_participants_effects, experiment_title="temp") {
+  participant_item_effect_grid <- expand.grid(participant = NUM_RATINGS_PER_ITEM,
+                                            item = NUM_ITEMS_PER_CONDITION,
+                                            model_effect = MODEL_EFFECT)
+
+  simulation_results <- foreach(row = isplitRows(participant_item_effect_grid, chunkSize=1), 
+                                .export=c("run_random_effects", 
+                                          "NUM_PARAMETER_SETS",
+                                          "create_experimental_design",
+                                          "simulate_random_effects",
+                                          "lowest_threshold",
+                                          "threshold_distances",
+                                          "sample_ratings_based_on_latent_normal_with_random_effects"), 
+                                .combine=rbind) %dopar% {
+    p_values <- run_random_effects(row$participant, row$item, row$model_effect,
+                                   by_items_effects, by_participants_effects)
+    saveRDS(p_values,
+            file = paste0("ordinal-power-simulation_",
+                          experiment_title,
+                          "_results_nsims",
+                          NUM_PARAMETER_SETS,
+                          "_p",
+                          row$participant,
+                          "_i",
+                          row$item,
+                          "_e",
+                          row$model_effect,
+                          ".Rds"))
+    cbind(row$participant, row$item, row$model_effect,
+          sum(p_values$lme_fe < 0.05, na.rm=TRUE)/length(p_values$lme_fe),
+          sum(p_values$clm_fe < 0.05, na.rm=TRUE)/length(p_values$lme_fe),
+          sum(p_values$lme_re < 0.05, na.rm=TRUE)/length(p_values$lme_fe),
+          sum(p_values$clm_re < 0.05, na.rm=TRUE)/length(p_values$lme_fe))
+  }
+  return(simulation_results)
+}
+```
+
+```{r run_low_variance}
+print(Sys.time())
+low_var_results <- run_given_variance(items_low, participants_low, "low-variance")
+```
+
+```{r show_time_after_lowvar}
+Sys.time()
+```
+
+View the low-variance results.
+
+```{r show_lowvar_results}
+low_var_results
+```
+
+```{r run_high_variance}
+print(Sys.time())
+
+high_var_results <- run_given_variance(items_high, participants_high, "high-variance")
+```
+
+
+```{r show_time_after_highvar}
+Sys.time()
+```
+
+View the high-variance results.
+
+```{r show_highvar_results}
+high_var_results
+```
+
+```{r run_general_variance}
+print(Sys.time())
+representative_results <- run_given_variance(items_representative, 
+                                             participants_representative,
+                                             "representative-variance")
+```
+
+
+```{r show_time_after_general_variance}
+Sys.time()
+```
+
+View the 'representative' results.
+
+```{r show_general_variance_results}
+representative_results
+```
+
+
+```{r run_extra_low_variance}
+print(Sys.time())
+extra_low_var_results <- run_given_variance(items_extra_low, 
+                                            participants_extra_low,
+                                            "extra-low-variance")
+```
+
+```{r show_time_after_extra_lowvar}
+Sys.time()
+```
+
+View the low-variance results.
+
+```{r show_extra_lowvar_results}
+extra_low_var_results
+```
+
+```{r run_extra_high_variance}
+print(Sys.time())
+
+extra_high_var_results <- run_given_variance(items_extra_high, 
+                                             participants_extra_high,
+                                             "extra_high_variance")
+```
+
+
+```{r show_time_after_extra_highvar}
+Sys.time()
+```
+
+View the high-variance results.
+
+```{r show_extra_highvar_results}
+extra_high_var_results
+```

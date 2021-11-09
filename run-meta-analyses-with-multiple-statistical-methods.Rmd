@@ -1,0 +1,493 @@
+---
+title: "Comparing Statistical Methods"
+author: "David M. Howcroft"
+date: "3/5/2021"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+subtitle: for human evaluations using rating scales
+bibliography: group-library_stats-for-human-eval.bib
+---
+
+```{r setup, include=FALSE}
+CACHE_PATH <- ".knitr-cache/comparing-statistical-methods_cache/"
+dir.create(CACHE_PATH, recursive = "TRUE")
+knitr::opts_chunk$set(echo = TRUE, verbose = TRUE)
+knitr::opts_chunk$set(cache.path = CACHE_PATH)
+```
+
+This document explores different approaches to analysing rating scale data 
+collected for human evaluations of natural language generation systems.
+
+We use four datasets also used by @card.etal2020 and two datasets of our own 
+and perform $t$-tests, linear mixed-effect model regressions, ordinal regresions,
+and Bayesian ordinal regressions.
+
+
+
+## Environment and Function Defs
+
+```{r libraries_and_function_defs, message=FALSE}
+# For Bayesian regressions
+library(brms)
+# For some functional programming convenience
+library(funprog)
+# For linear mixed effect modelling
+library(lme4)
+# For LME p-values
+library(lmerTest)
+# For optimization algorithms
+library(optimx)
+# For frequentist ordinal models
+library(ordinal)
+# For data wrangling, etc
+library(tidyverse)
+
+# Libraries and config for multicore processing
+library(foreach)
+library(doParallel)
+library(itertools)
+
+# NB: makeForkCluster() not valid on Windows
+# I use 6 cores since my desktop has 6 physical cores plus multithreading.
+NUM_CORES = 6
+cl <- parallel::makeForkCluster(NUM_CORES)
+doParallel::registerDoParallel(cl)
+options(mc.cores = NUM_CORES)
+
+USE_CACHED_MODELS <- TRUE
+```
+
+## Data Preparation
+
+The first four datasets are those used by Card et al., 
+so we assume that you have cloned [their GitHub repository](https://github.com/dallascard/NLP-power-analysis) into `../card-et-al2020_NLP-power-analysis/`
+and run their Jupyter notebooks for downloading and preparing data.
+
+The other two datasets are based on @novikova.etal2017.
+
+### HUSE Language Modelling Data
+
+```{r load_huse_lm, message=FALSE}
+load_huse_data <- function(filepath) {
+  read_csv(filepath) %>%
+    mutate(
+      X1=NULL, # This column is an artefact of reading in the CSV
+      worker=NULL # We don't want to use raw AMT Worker IDs
+      ) %>%
+    rename(
+      participant=worker_id,
+      mr=input_id, 
+      integral_response=response_val) %>%
+    mutate(
+      model=as.factor(model),
+      mr=as.factor(mr),
+      participant=as.factor(participant),
+      evaluated_text=as.factor(output),
+      normalised_response = (integral_response - min(integral_response))/max(integral_response),
+      ordinal_response=as.ordered(integral_response))
+}
+
+huse_lm_df <- load_huse_data("card-et-al2020_NLP-power-analysis/data/annotated_datasets/huse_lm.csv")
+```
+
+Let's double check what the data looks like
+
+```{r preview_huse_lm}
+head(huse_lm_df)
+```
+
+### HUSE Summarisation Data
+
+```{r load_huse_summarisation, message=FALSE}
+huse_summarisation_df <- load_huse_data("card-et-al2020_NLP-power-analysis/data/annotated_datasets/huse_summarization.csv")
+```
+
+View the first few rows of the data.
+
+```{r preview_huse_summarization}
+head(huse_summarisation_df)
+```
+
+### HUSE Reddit Dataset
+
+```{r load_huse_reddit, message=FALSE}
+huse_reddit_df <- load_huse_data("card-et-al2020_NLP-power-analysis/data/annotated_datasets/huse_reddit.csv")
+```
+
+View the first few rows of the data.
+
+```{r preview_huse_reddit}
+head(huse_reddit_df)
+```
+
+### Uber Data
+
+
+```{r load_uber, message=FALSE}
+load_pplm_data <- function(filepath) {
+  read_csv(filepath) %>%
+    mutate(
+      X1=NULL # This column is an artefact of reading in the CSV
+      ) %>%
+    rename(
+      participant=annotator,
+      mr=item_id, # TODO: double check that this is correct for PPLM data 
+      integral_response=rating,
+      normalised_response = rating_scaled
+      ) %>%
+    mutate(
+      model=as.factor(model),
+      mr=as.factor(mr),
+      participant=fct_anon(as.factor(participant)), # Instead of using the names given in the dataset, we anonymise them
+      evaluated_text=as.factor(text),
+      ordinal_response=as.ordered(integral_response))
+}
+
+uber_df <- load_pplm_data("card-et-al2020_NLP-power-analysis/data/annotated_datasets/uber_all.csv")
+```
+
+View the first few rows of the data.
+
+```{r preview_uber}
+head(uber_df)
+```
+
+### NEM Dataset
+
+Note that with the NEM dataset, workers 1, 2, and 3 are not the *same* worker 1, worker 2, and worker 3 throughout the dataset,
+so we can't really estimate by-participants variation.
+
+```{r}
+nem_df <- read_csv("NEM/emnlp_data_individual_hum_scores.csv") %>%
+  mutate(
+    mr = as.factor(mr),
+    evaluated_text = as.factor(sys_ref),
+    model = as.factor(system),
+    dataset = as.factor(dataset),
+    judge = as.factor(judge),
+    integral_response = quality,
+    normalised_response = (quality - min(quality))/max(quality),
+    ordinal_response = as.ordered(quality))
+nem_bagel_df <- nem_df %>% 
+  filter(dataset == "BAGEL") %>% 
+  droplevels()
+nem_sfx_df <- nem_df %>% 
+  filter(dataset %in% c("SFRES", "SFHOT")) %>% 
+  droplevels()
+```
+
+### Karin Sevegnani's improved NEM dataset
+
+Note, however, that this dataset does not include source dataset information, 
+so we cannot distinguish between BAGEL and SFX MRs & texts.
+This data also lacks worker information, 
+so we provide dummy information for code compatibility,
+though the maximal model for this dataset would actually exclude by-worker terms.
+
+```{r load_ksdata}
+ks_nem_df <- read_csv("ksdata/indiv_ratings_parsed.csv") %>%
+  mutate(
+    mr = as.factor(mr),
+    model = as.factor(system),
+    evaluated_text = as.factor(system_ref),
+    integral_response = quality,
+    normalised_response = (quality - min(quality))/max(quality),
+    ordinal_response = as.ordered(quality)
+  )
+```
+
+### Grouping, cleaning, and summarising the datasets
+
+We want to have a list of datasets we can loop over, so lets create that now.
+We'll use the variable name we are using for that dataset as its name in the list,
+which will also give us the dataframe names programmatically (when we access them by looping over `names(df_list)`).
+
+```{r prep_df_list}
+df_list <- list(huse_lm=huse_lm_df, 
+                huse_summarisation=huse_summarisation_df,
+                huse_reddit=huse_reddit_df,
+                uber=uber_df,
+                nem_bagel=nem_bagel_df,
+                nem_sfx=nem_sfx_df,
+                ks_nem=ks_nem_df)
+```
+
+We should ensure that fixed effects factors are coded in the same way for all datasets.
+We use the same 'sum coding' used by Card et al.
+
+```{r set_contrast_matrices}
+for (name in names(df_list)) {
+  # contrasts(df_list[[name]]$model) <- contr.sum(length(unique(df_list[[name]]$model)))
+  contrasts(df_list[[name]]$model) <- contr.treatment(length(unique(df_list[[name]]$model)))
+}
+```
+
+With this coding scheme, the intercepts will be the grand mean (i.e. the mean of the `model` means; $\beta_0$)
+and the 'slopes' ($\beta_i$) will be the deviation of a particular model from the grand mean.
+The last model listed when calling `levels()` on the `model` column of the dataframe
+is the model which will be 'left out' of the comparison.
+
+Alternative coding schemes include 'dummy coding' (a.k.a. 'treatment coding'), 
+where the intercept represents the mean for one 'reference' model
+and the slopes represent the difference between other models and the reference.
+It might make sense to use this coding scheme and set the reference model to be
+the human or machine baseline.
+
+For now, we set the issue of choosing a contrast coding scheme aside and examine the datasets.
+
+```{r descriptive_statistics}
+for (name in names(df_list)) {
+  writeLines(name)
+  print(df_list[[name]] %>%
+    group_by(model) %>%
+    summarise(
+      mean=mean(integral_response),
+      sd=sd(integral_response),
+      normalised_mean=mean(normalised_response), 
+      normalised_sd=sd(normalised_response)))
+  writeLines("")
+}
+```
+
+
+## Simple Parametric Tests
+
+Let's apply $t$-tests to each dataset's integral responses and each dataset's normalised data.
+Note that we *could* use paired t-tests if we have the same number of items per group and they are, e.g., all based on the same MR.
+
+```{r t_test_integral}
+for (name in names(df_list)) {
+  writeLines(name)
+  print(pairwise.t.test(df_list[[name]]$integral_response, df_list[[name]]$model))
+  writeLines("")
+}
+```
+
+```{r t_test_normalised}
+for (name in names(df_list)) {
+  writeLines(name)
+  print(pairwise.t.test(df_list[[name]]$normalised_response, df_list[[name]]$model))
+  writeLines("")
+}
+```
+
+## Linear Mixed Effects Models
+
+Now let's apply maximal mixed effects models to both the integral and the normalised response values.
+
+```{r def_build_maximal_formula_string}
+build_maximal_formula_string <- function(df, response, fixed_effects, random_effects) {
+  if (all(fixed_effects %in% names(df))) {
+    formula_string <- paste0(response, " ~ ")
+    fixed_effects_string <- paste(unlist(fixed_effects), sep = " + ")
+    random_effects_string <- ""
+    for (random_effect in random_effects) {
+      if (random_effect %in% names(df)) {
+        random_effects_string <- paste0(random_effects_string, 
+                                        " + (", fixed_effects_string, "|", random_effect, ")")
+      }
+    }
+    formula_string <- paste0(formula_string, fixed_effects_string, random_effects_string)
+    return(formula_string)
+  }
+}
+```
+
+```{r def_print_summaries}
+print_summaries <- function(fit_list) {
+  for (name in names(fit_list)) {
+    writeLines(name)
+    writeLines("Formula structure:")
+    print(formula(fit_list[[name]]))
+    print(summary(fit_list[[name]]))
+    writeLines("")
+  }
+  return(NULL)
+}
+```
+
+```{r def_load_cached_model}
+load_most_recent_cached_model <- function(directory, model_filename_prefix) {
+  fit_files <- list.files(directory, model_filename_prefix)
+  if (length(fit_files) > 0) {
+    sorted <- sort_by(fit_files, file.mtime)
+    file_to_load <- sorted[length(sorted)]
+    full_path <- file.path(directory, file_to_load)
+    writeLines(paste("Loading model from", full_path))
+    return(readRDS(full_path))
+  } else {
+    return(NULL)
+  }
+}
+
+```
+
+```{r lme_normalised}
+if (USE_CACHED_MODELS) {
+  fit_lme_maximal_normalised <- load_most_recent_cached_model("comparing-statistical-methods/",
+                                                              "fit_lme_maximal_normalised")
+} else {
+  fit_lme_maximal_normalised <- NULL
+}
+if (is.null(fit_lme_maximal_normalised)) {
+  fit_lme_maximal_normalised <- list()
+  for (name in names(df_list)) {
+    writeLines(name)
+    formula_string <- build_maximal_formula_string(df_list[[name]], 
+                                                   response="normalised_response",
+                                                   fixed_effects=c("model"),
+                                                 random_effects=c("participant", 
+                                                                  "mr"))
+    writeLines(formula_string)/0
+    fit_lme_maximal_normalised[[name]] <- lmer(formula(formula_string),
+                                               data=df_list[[name]],
+                                               REML=FALSE)
+    print(summary(fit_lme_maximal_normalised[[name]]))
+    writeLines("")
+  }
+  saveRDS(fit_lme_maximal_normalised, 
+          paste0("comparing-statistical-methods/fit_lme_maximal_normalised", 
+                 sub(" ", "_", Sys.time()), 
+                 ".rds"))
+}
+print_summaries(fit_lme_maximal_normalised)
+```
+
+
+## Ordinal Regression Model
+
+
+```{r fit_ordinal_maximal}
+if (USE_CACHED_MODELS) {
+  fit_ordinal_maximal <- load_most_recent_cached_model("comparing-statistical-methods/", 
+                                                       "fit_ordinal_maximal")
+} else {
+  fit_ordinal_maximal <- NULL
+}
+if (is.null(fit_ordinal_maximal)) {
+  fit_ordinal_maximal <- list()
+  for (name in names(df_list)) {
+    writeLines(name)
+    formula_string <- build_maximal_formula_string(df_list[[name]], 
+                                                   response="ordinal_response",
+                                                   fixed_effects=c("model"),
+                                                 random_effects=c("participant", 
+                                                                  "mr"))
+    writeLines(formula_string)
+    fit_ordinal_maximal[[name]] <- clmm(formula(formula_string),
+                                        data=df_list[[name]],
+                                        link = "probit",
+                                        threshold = "flexible")
+    writeLines("")
+  }
+  saveRDS(fit_ordinal_maximal, 
+          paste0("comparing-statistical-methods/fit_ordinal_maximal", 
+                 sub(" ", "_", Sys.time()), 
+                 ".rds"))
+}
+print_summaries(fit_ordinal_maximal)
+```
+
+
+## Bayesian Ordinal Regression Model
+
+
+```{r fit_brms_maximal, cache=TRUE}
+fit_brms_maximal <- list()
+for (name in names(df_list)) {
+  writeLines(name)
+  formula_string <- build_maximal_formula_string(df_list[[name]], 
+                                                 response="ordinal_response",
+                                                 fixed_effects=c("model"),
+                                                 random_effects=c("participant", 
+                                                                  "mr"))
+  writeLines(formula_string)
+  filename <- paste0('brms-models/fit_brms_maximal_dummy_', name)
+  fit_brms_maximal[[name]] <- brm(data=df_list[[name]],
+                                  formula(formula_string),
+                                  family = cumulative("probit",
+                                                      threshold = "flexible"),
+                                  control = list(adapt_delta = 0.99),
+                                  file = filename)
+  print(summary(fit_brms_maximal[[name]]))
+
+  conditional_effects(fit_brms_maximal[[name]], "model", categorical = TRUE)
+  
+  writeLines("")
+}
+
+```
+
+## Summaries of effects
+
+
+```{r fixed_effects_summary}
+fixed_effects_summary <- tibble()
+for (dataset_name in names(fit_ordinal_maximal)) {
+  vals <- as.data.frame(matrix(coef(fit_ordinal_maximal[[dataset_name]]), nrow=1))
+  names(vals) <- names(coef(fit_ordinal_maximal[[dataset_name]]))
+  fixed_effects_summary <- bind_rows(fixed_effects_summary, c("datset"=dataset_name, vals))
+}
+fixed_effects_summary <- fixed_effects_summary %>% mutate(across(starts_with("model"), as.numeric))
+fixed_effects <- as.vector(as.matrix(fixed_effects_summary %>% select(starts_with("model"))))
+summary(abs(fixed_effects))
+thresholds_summary <- fixed_effects_summary %>% 
+  # A previous version of the next line only checked for pipe (|)
+  select(contains("|")|contains("data")) %>% 
+  mutate(
+    min_threshold = if_else(!is.na(`0|1`), `0|1`, `1|2`),
+    max_threshold = if_else(!is.na(`5|6`), `5|6`, `4|5`),
+    diff_1 = `1|2` - `0|1`,
+    diff_2 = `2|3` - `1|2`,
+    diff_3 = `3|4` - `2|3`,
+    diff_4 = `4|5` - `3|4`,
+    diff_5 = `5|6` - `4|5`) %>% 
+  select(-contains('|'))
+summary(thresholds_summary %>% select(contains("threshold")))
+summary(as.vector(as.matrix(thresholds_summary %>% select(starts_with("diff")))))
+sd(as.vector(as.matrix(thresholds_summary %>% select(starts_with("diff")))), na.rm=TRUE)
+```
+
+```{r by_participant_sds}
+by_participant_sds <- tibble()
+for (dataset_name in names(fit_ordinal_maximal)) {
+  vals <- attr(VarCorr(fit_ordinal_maximal[[dataset_name]])$participant, "stddev")
+  if (!is.null(vals)) {
+    model_names <- paste0("model", 2:length(vals))
+    names(vals) <- c("intercept", model_names)
+  }
+  by_participant_sds <- bind_rows(by_participant_sds, c("datset"=dataset_name, vals))
+}
+by_participant_sds <- by_participant_sds %>% mutate(across(starts_with("model")|starts_with("intercept"), as.numeric))
+summary(by_participant_sds$intercept)
+slopes <- as.vector(as.matrix(by_participant_sds %>% select(starts_with("model"))))
+summary(slopes)
+```
+
+
+```{r by_mr_sds}
+by_mr_sds <- tibble()
+for (dataset_name in names(fit_ordinal_maximal)) {
+  vals <- attr(VarCorr(fit_ordinal_maximal[[dataset_name]])$mr, "stddev")
+  if (!is.null(vals)) {
+    model_names <- paste0("model", 2:length(vals))
+    names(vals) <- c("intercept", model_names)
+  }
+  by_mr_sds <- bind_rows(by_mr_sds, c("datset"=dataset_name, vals))
+}
+by_mr_sds <- by_mr_sds %>% mutate(across(starts_with("model")|starts_with("intercept"), as.numeric))
+summary(by_mr_sds$intercept)
+slopes <- as.vector(as.matrix(by_mr_sds %>% select(starts_with("model"))))
+summary(slopes)
+```
+
+## Session Info
+
+```{r}
+utils::sessionInfo()
+```
+
+
+## References

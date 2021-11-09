@@ -1,0 +1,191 @@
+---
+title: "LME Power Simulation (Card et al. 2020)"
+author: "Dave Howcroft"
+date: "2/17/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+CACHE_PATH <- ".knitr-cache/card-lme-power-simulation_cache/"
+dir.create(CACHE_PATH, recursive = "TRUE")
+knitr::opts_chunk$set(echo = TRUE, verbose = TRUE)
+knitr::opts_chunk$set(cache.path = CACHE_PATH)
+```
+
+## Environment and Function Defs
+
+```{r libraries_and_function_defs}
+# Libraries for mixed effects models and data wrangling
+library(lme4)
+library(lmerTest)
+library(tidyverse)
+
+# Libraries and config for multicore processing
+library(foreach)
+library(doParallel)
+library(itertools)
+
+# NB: makeForkCluster() not valid on Windows
+NUM_CORES <- 6
+cl <- parallel::makeForkCluster(NUM_CORES)
+doParallel::registerDoParallel(cl)
+```
+
+
+### Fake experimental design matrix
+
+We need a matrix for the full set of participants and items,
+where we also account for the fact that participants may see a subset of items.
+
+Note that the `sample_n(nperitem)` call will ensure we have the right number of participants for each item $\times$ model combination,
+but I do not believe it will ensure that every participant sees the same number of items.
+That is, I think this function is underconstrained for cases where`nannotators != nperitem`.
+```{r def_generate_worker_item_model_triples}
+#' make a data set with a full factorial of annotators, items
+#' 
+#' 2 conditions for model: 1 or 0
+#' NB: model is actually coded as 1 or -1 (maybe for better contrasts?)
+#'
+#' Card et al. adapted this from https://rstudio-pubs-static.s3.amazonaws.com/11703_21d1c073558845e1b56ec921c6e0931e.html
+#'
+#' @param nannotators total number of annotators
+#' @param nitems total number of items
+#' @param nperitem number of ratings for each item from each model
+#' @return a dataframe with columns `worker`, `item`, and `model` with `nperitem` workers for each combination of `item` and `model`
+generate_worker_item_model_triples <- function(nannotators, nitems, nperitem) {
+  # TODO figure out why they code model this way
+  return(expand.grid(worker = factor(1:nannotators),
+                        item = factor(1:nitems),
+                        model = c(-1, 1)) %>%
+              group_by(item, model) %>%
+              sample_n(nperitem))
+}
+```
+
+```{r def_simulate_power_params} 
+#' Simulation to estimate power.
+#' 
+#' Uses a fixed seed (101) for every call to the function.
+#'
+#' Taken in part from https://rstudio-pubs-static.s3.amazonaws.com/11703_21d1c073558845e1b56ec921c6e0931e.html
+#'
+#' @param num.iter
+#' @param nannotators
+#' @param nitems
+#' @param nperiter
+#' @param intercept
+#' @param beta
+#' @param item.model
+#' @param item.Intercept
+#' @param worker.model
+#' @param worker.Intercept
+#' @param sigma
+#' @return a single float reflecting the estimated power for the given parameters
+simulate_power_params <- function(num_iterations, num_annotators, num_items, num_annotators_per_item_x_model, 
+                                  intercept, beta,
+                                  item.model, item.Intercept, 
+                                  worker.model, worker.Intercept, 
+                                  sigma) {
+  
+  expdat <- generate_worker_item_model_triples(num_annotators, num_items, num_annotators_per_item_x_model)
+  
+  set.seed(101)
+  beta <- c(intercept, beta) # intercept effect
+  names(beta) = c("(Intercept)", "model")
+  
+  # specify sigma and theta in sd space
+  theta <- c(item.model, item.Intercept, worker.model, worker.Intercept) #item.model, item.Intercept, worker.model, worker.Intercept
+  names(theta) = c("item.model", "item.(Intercept)", "worker.model", "worker.(Intercept)")
+  theta = theta/sigma # theta is specified scaled by sigma, so we divide to get it in the right space
+  
+  # simulate 
+  ss <- simulate(~model + (1 + model || worker) + (1 + model || item),
+                 nsim = num_iterations,
+                 family = "gaussian", 
+                 newdata = expdat,
+                 newparams = list(theta = theta, beta = beta, sigma=sigma),
+                 REML=F)
+  
+  # fit a model for num.iter times, return time t value is greater than 1.96
+  fitsim <- function(i) {
+    expdat$resp <- ss[[i]]
+    coef(summary(lmer(resp ~ model + (1 + model || worker) + (1 + model || item),
+               data = expdat, REML=F)))["model", ]
+  }
+  fitAll <- t(data.frame(lapply(seq(num_iterations), function(i) fitsim(i))))
+  # print(fitAll)
+  return(list(t_value_power = mean(fitAll[, 't value'] > 1.96), 
+              anova_power = mean(fitAll[, 'Pr(>|t|)'] < 0.05)))
+}
+```
+
+Some of our parameters are the same for both models: 
+we want to plot power curves for effect sizes ranging from 0.5 to 0.2 on a normalized 0-1 scale, and
+we want to plot curves for each combination of number of items and number of workers as well.
+In the simulations for Card et al. 2020, they assume that every participant rates every item.
+
+```{r set_simulation_parameters}
+grid_search_params <- list(true_diffs = c(.05, .1, .15, .2),
+                           num_items = c(50, 100, 500),
+                           num_workers = c(3,10)
+)
+fixed_params <- list(num_iterations = 200, grand_intercept = 0.5)
+```
+
+## LME with low-variance parameters
+
+```{r lmer_low_var_foreach, cache=TRUE}
+lmer.overall.lowvar <- foreach(row = isplitRows(expand.grid(grid_search_params), chunkSize=1), .combine=rbind) %dopar% {
+  power_list <- simulate_power_params(fixed_params$num_iterations, row$num_workers, row$num_items, row$num_workers, 
+                                      fixed_params$grand_intercept, row$true_diffs, 
+                                      # Low-variance settings for LME simulations
+                                      .13, .01, 
+                                      .04, .01, 
+                                      .16)
+  # columns end up being V1, V2, power, V4
+  cbind(row$true_diffs, row$num_items, power_list$t_value_power, power_list$anova_power, row$num_workers)
+}
+```
+```{r postprocess_low_var}
+lmer.overall.lowvar = data.frame(lmer.overall.lowvar)
+lmer.overall.lowvar$`Number of Items` = as.factor(lmer.overall.lowvar$X2)
+```
+
+## LME with high-variance parameters
+
+```{r lmer_high_var_foreach, cache=TRUE}
+lmer.overall.highvar <- foreach(row = isplitRows(expand.grid(grid_search_params), chunkSize=1), .combine=rbind) %dopar% {
+  power_list <- simulate_power_params(fixed_params$num_iterations, row$num_workers, row$num_items, row$num_workers, 
+                                 fixed_params$grand_intercept, row$true_diffs, 
+                                 # High-variance settings for LME simulations
+                                    .14, .04, 
+                                    .11, .01, 
+                                    .26)
+  # columns end up being V1, V2, power, V4
+  cbind(row$true_diffs, row$num_items, power_list$t_value_power, power_list$anova_power, row$num_workers)
+}
+
+lmer.overall.highvar = data.frame(lmer.overall.highvar)
+lmer.overall.highvar$`Number of Items` = as.factor(lmer.overall.highvar$X2)
+```
+
+## Combine the generated data and plot it
+
+```{r combine_and_plot}
+tot.lmer = bind_rows(mutate(lmer.overall.highvar, settings= "High var. settings"), 
+                     mutate(lmer.overall.lowvar, settings = "Low var. settings"))
+
+write.csv(tot.lmer, file="highvar_lowmer_lmer.csv")
+ggplot(filter(tot.lmer, `Number of Items` != 200, X5 %in% c(3, 10)) %>%
+         mutate(`X5` = as.factor(paste("Num. Workers:", X5)),
+                `X5` = fct_relevel(X5, "Num. Workers: 3", "Num. Workers: 10")), 
+       aes(x=X1, y=X4, group=`Number of Items`, colour=`Number of Items`)) + geom_line() + 
+  facet_grid(settings ~ X5) +
+  xlab("mean difference") + ylab("power") + theme_bw(10) + 
+  xlim(0, .2) + ylim(0,1) + geom_point(alpha=.2) +
+  theme(legend.position = "bottom")
+ggsave("power_var_settings_highlow.pdf", width=4.3, height=4)
+```
+
